@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 Pillow
+pillow-heif
 numpy
 opencv-python-headless
 gunicorn
