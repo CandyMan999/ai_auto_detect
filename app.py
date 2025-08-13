@@ -9,6 +9,9 @@ from PIL import Image
 import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from nudity_service import process_video
+
 
 # Queue (optional but recommended for bursts)
 import redis
@@ -178,3 +181,31 @@ def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
     if result.get("error"):
         raise HTTPException(status_code=result["status"], detail=result["error"])
     return {"status": "done", "faces": result["faces"], "is_face": result["is_face"]}
+
+class NudityRequest(BaseModel):
+    video_url: str
+
+@app.post("/nudity/detect")
+async def nudity_detect_sync(req: NudityRequest, x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
+    model_path = os.getenv("NUDENET_MODEL_PATH")  # optional
+    res = process_video(req.video_url, model_path=model_path)
+    if res.get("error"):
+        raise HTTPException(status_code=res["status"], detail=res["error"])
+    return res
+
+@app.post("/nudity/detect_async")
+async def nudity_detect_async(req: NudityRequest, x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
+    q = get_queue()
+    if not q:
+        # graceful fallback
+        model_path = os.getenv("NUDENET_MODEL_PATH")
+        res = process_video(req.video_url, model_path=model_path)
+        if res.get("error"):
+            raise HTTPException(status_code=res["status"], detail=res["error"])
+        return {**res, "mode": "sync_fallback"}
+
+    # pass model_path explicitly so worker doesn't rely on env if you don't want to
+    job = q.enqueue("nudity_service.process_video", req.video_url, os.getenv("NUDENET_MODEL_PATH"), result_ttl=600, ttl=120)
+    return {"job_id": job.get_id(), "status": "queued"}

@@ -9,3 +9,7 @@ requests
 pillow-heif
 redis
 rq
+nudenet
+onnxruntime
+nudenet
+onnxruntime
