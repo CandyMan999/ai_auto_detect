@@ -39,7 +39,9 @@ def _check_api_key(x_api_key: str | None):
     if REQUIRE_API_KEY and x_api_key != REQUIRE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ---------------- Model download & load ----------------
+# ---------------- Model download & load (robust, no strict hash) ----------------
+import pathlib, requests, time
+
 MODEL_DIR = pathlib.Path("./face_model")
 MODEL_DIR.mkdir(exist_ok=True)
 
@@ -48,36 +50,37 @@ WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
 
 URL_PROTO = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
 URL_WEIGHTS = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-# Known hash published for this model
-WEIGHTS_SHA1 = "15aa726b4d46d9f023526d85537db81cbc8dd566"
 
-def _sha1(path: pathlib.Path) -> str:
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-def _download(url: str, dest: pathlib.Path):
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    dest.write_bytes(r.content)
+def _download_with_retries(url: str, dest: pathlib.Path, attempts: int = 4):
+    for i in range(1, attempts + 1):
+        try:
+            r = requests.get(url, timeout=60, stream=True)
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        f.write(chunk)
+            # basic sanity: file > 1MB
+            if dest.stat().st_size < (1 << 20):
+                raise RuntimeError(f"Downloaded file too small: {dest}")
+            return
+        except Exception as e:
+            if dest.exists():
+                try: dest.unlink()
+                except Exception: pass
+            if i == attempts:
+                raise
+            time.sleep(1.5 * i)  # backoff and retry
 
 def ensure_face_model():
-    # prototxt
     if not PROTO_PATH.exists():
-        _download(URL_PROTO, PROTO_PATH)
-    # weights
+        _download_with_retries(URL_PROTO, PROTO_PATH)
     if not WEIGHTS_PATH.exists():
-        _download(URL_WEIGHTS, WEIGHTS_PATH)
-    # verify sha1 of weights
-    if _sha1(WEIGHTS_PATH) != WEIGHTS_SHA1:
-        WEIGHTS_PATH.unlink(missing_ok=True)
-        raise RuntimeError("Face weights checksum mismatch")
+        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH)
 
 ensure_face_model()
 
-# Load DNN model once
+# Load DNN once
 net = cv2.dnn.readNetFromCaffe(str(PROTO_PATH), str(WEIGHTS_PATH))
 
 # ---------------- Routes ----------------

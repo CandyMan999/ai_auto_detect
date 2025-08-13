@@ -1,10 +1,9 @@
-fastapi
-uvicorn[standard]
-python-multipart
-Pillow
-pillow-heif
-numpy
-opencv-python-headless
+Flask
 gunicorn
+opencv-python-headless
+numpy
+pillow
+python-multipart
 requests
-
+pyheif
+imageio
