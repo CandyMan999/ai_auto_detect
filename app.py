@@ -25,7 +25,7 @@ except Exception:
 MAX_BYTES   = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB default
 CONF_THRESH = float(os.getenv("FACE_CONF", "0.65"))               # 0.5 permissive … 0.8 strict
 REQUIRE_API_KEY = os.getenv("API_KEY")                            # if set, require x-api-key
-REDIS_URL  = os.getenv("REDIS_URL")                               # set by Heroku Redis
+REDIS_URL = os.getenv("REDIS_TLS_URL") or os.getenv("REDIS_URL")                              # set by Heroku Redis
 
 # ---------- FastAPI App + CORS ----------
 app = FastAPI(title="Face Gate (OpenCV DNN + Queue)")
