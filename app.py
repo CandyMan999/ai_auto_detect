@@ -1,8 +1,8 @@
 # app.py
 import io
 import os
-import hashlib
 import pathlib
+import time
 import requests
 import numpy as np
 from PIL import Image
@@ -15,7 +15,6 @@ try:
     from pillow_heif import register_heif_opener  # type: ignore
     register_heif_opener()
 except Exception:
-    # If pillow-heif isn't installed, JPEG/PNG/WEBP still work.
     pass
 
 # ---------------- Config ----------------
@@ -39,9 +38,7 @@ def _check_api_key(x_api_key: str | None):
     if REQUIRE_API_KEY and x_api_key != REQUIRE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ---------------- Model download & load (robust, no strict hash) ----------------
-import pathlib, requests, time
-
+# ---------------- Model download & load (robust) ----------------
 MODEL_DIR = pathlib.Path("./face_model")
 MODEL_DIR.mkdir(exist_ok=True)
 
@@ -51,36 +48,40 @@ WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
 URL_PROTO = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
 URL_WEIGHTS = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
 
-def _download_with_retries(url: str, dest: pathlib.Path, attempts: int = 4):
+UA = {"User-Agent": "face-gate/1.0"}  # helps avoid some CDN issues
+
+def _download_with_retries(url: str, dest: pathlib.Path, attempts: int = 4, min_bytes: int = 1024):
     for i in range(1, attempts + 1):
         try:
-            r = requests.get(url, timeout=60, stream=True)
-            r.raise_for_status()
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    if chunk:
-                        f.write(chunk)
-            # basic sanity: file > 1MB
-            if dest.stat().st_size < (1 << 20):
-                raise RuntimeError(f"Downloaded file too small: {dest}")
+            with requests.get(url, timeout=90, stream=True, headers=UA, allow_redirects=True) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+            # sanity check
+            if dest.stat().st_size < min_bytes:
+                raise RuntimeError(f"Downloaded file too small: {dest} ({dest.stat().st_size} bytes)")
             return
-        except Exception as e:
+        except Exception:
             if dest.exists():
                 try: dest.unlink()
                 except Exception: pass
             if i == attempts:
                 raise
-            time.sleep(1.5 * i)  # backoff and retry
+            time.sleep(1.5 * i)  # backoff
 
 def ensure_face_model():
+    # prototxt is small (~30–40 KB) ⇒ require >1 KB
     if not PROTO_PATH.exists():
-        _download_with_retries(URL_PROTO, PROTO_PATH)
+        _download_with_retries(URL_PROTO, PROTO_PATH, min_bytes=1 * 1024)
+    # caffemodel is ~10–11 MB ⇒ require >5 MB
     if not WEIGHTS_PATH.exists():
-        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH)
+        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH, min_bytes=5 * 1024 * 1024)
 
 ensure_face_model()
 
-# Load DNN once
+# Load DNN model once (Caffe)
 net = cv2.dnn.readNetFromCaffe(str(PROTO_PATH), str(WEIGHTS_PATH))
 
 # ---------------- Routes ----------------
@@ -108,15 +109,11 @@ async def detect_face(
         raise HTTPException(status_code=400, detail="File is not a valid image")
 
     arr = np.array(img)  # HxWx3 RGB
-    (h, w) = arr.shape[:2]
-
-    # Create blob for DNN: 300x300, mean subtraction, swapRB=True per model
     blob = cv2.dnn.blobFromImage(arr, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
     net.setInput(blob)
-    detections = net.forward()  # shape [1,1,N,7]
+    detections = net.forward()  # shape [1,1,N,7]  => [id, conf, x1,y1,x2,y2]
 
     count = 0
-    # detections[0,0,i] = [id, conf, x1, y1, x2, y2] (x/y are normalized)
     for i in range(detections.shape[2]):
         conf = float(detections[0, 0, i, 2])
         if conf >= CONF_THRESH:
