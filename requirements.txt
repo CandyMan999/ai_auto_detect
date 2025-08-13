@@ -7,3 +7,5 @@ Pillow
 python-multipart
 requests
 pillow-heif
+redis
+rq

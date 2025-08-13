@@ -1,8 +1,8 @@
 # app.py
 import io
 import os
-import pathlib
 import time
+import pathlib
 import requests
 import numpy as np
 from PIL import Image
@@ -10,25 +10,28 @@ import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
-# --- Optional HEIC/HEIF support (iPhone) ---
+# Queue (optional but recommended for bursts)
+import redis
+from rq import Queue
+
+# ---------- Optional HEIC/HEIF support (iPhone) ----------
 try:
     from pillow_heif import register_heif_opener  # type: ignore
     register_heif_opener()
 except Exception:
     pass
 
-# ---------------- Config ----------------
-MAX_BYTES = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB default
-REQUIRE_API_KEY = os.getenv("API_KEY")  # if set, require x-api-key header
-CONF_THRESH = float(os.getenv("FACE_CONF", "0.65"))  # 0.5 permissive … 0.8 strict
+# ---------- Config ----------
+MAX_BYTES   = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB default
+CONF_THRESH = float(os.getenv("FACE_CONF", "0.65"))               # 0.5 permissive … 0.8 strict
+REQUIRE_API_KEY = os.getenv("API_KEY")                            # if set, require x-api-key
+REDIS_URL  = os.getenv("REDIS_URL")                               # set by Heroku Redis
 
-# ---------------- App ----------------
-app = FastAPI(title="Face Gate (OpenCV DNN)")
-
-# CORS: open by default; narrow to your domains later
+# ---------- FastAPI App + CORS ----------
+app = FastAPI(title="Face Gate (OpenCV DNN + Queue)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # e.g., ["https://yourapp.com"]
+    allow_origins=["*"],   # tighten to your domains later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -38,19 +41,18 @@ def _check_api_key(x_api_key: str | None):
     if REQUIRE_API_KEY and x_api_key != REQUIRE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ---------------- Model download & load (robust) ----------------
+# ---------- Model download & load (robust) ----------
 MODEL_DIR = pathlib.Path("./face_model")
 MODEL_DIR.mkdir(exist_ok=True)
 
-PROTO_PATH = MODEL_DIR / "deploy.prototxt"
-WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
+PROTO_PATH   = MODEL_DIR / "deploy.prototxt"                               # ~30–40 KB
+WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"      # ~10–11 MB
 
-URL_PROTO = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+URL_PROTO   = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
 URL_WEIGHTS = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+UA = {"User-Agent": "face-gate/1.0"}  # helps with some CDNs
 
-UA = {"User-Agent": "face-gate/1.0"}  # helps avoid some CDN issues
-
-def _download_with_retries(url: str, dest: pathlib.Path, attempts: int = 4, min_bytes: int = 1024):
+def _download_with_retries(url: str, dest: pathlib.Path, attempts: int, min_bytes: int):
     for i in range(1, attempts + 1):
         try:
             with requests.get(url, timeout=90, stream=True, headers=UA, allow_redirects=True) as r:
@@ -59,7 +61,6 @@ def _download_with_retries(url: str, dest: pathlib.Path, attempts: int = 4, min_
                     for chunk in r.iter_content(chunk_size=1 << 20):
                         if chunk:
                             f.write(chunk)
-            # sanity check
             if dest.stat().st_size < min_bytes:
                 raise RuntimeError(f"Downloaded file too small: {dest} ({dest.stat().st_size} bytes)")
             return
@@ -72,55 +73,108 @@ def _download_with_retries(url: str, dest: pathlib.Path, attempts: int = 4, min_
             time.sleep(1.5 * i)  # backoff
 
 def ensure_face_model():
-    # prototxt is small (~30–40 KB) ⇒ require >1 KB
     if not PROTO_PATH.exists():
-        _download_with_retries(URL_PROTO, PROTO_PATH, min_bytes=1 * 1024)
-    # caffemodel is ~10–11 MB ⇒ require >5 MB
+        _download_with_retries(URL_PROTO, PROTO_PATH, attempts=4, min_bytes=1 * 1024)         # >1 KB
     if not WEIGHTS_PATH.exists():
-        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH, min_bytes=5 * 1024 * 1024)
+        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH, attempts=4, min_bytes=5 * 1024 * 1024)  # >5 MB
 
 ensure_face_model()
 
-# Load DNN model once (Caffe)
-net = cv2.dnn.readNetFromCaffe(str(PROTO_PATH), str(WEIGHTS_PATH))
+# Load once per process
+NET = cv2.dnn.readNetFromCaffe(str(PROTO_PATH), str(WEIGHTS_PATH))
 
-# ---------------- Routes ----------------
-@app.get("/health")
-def health():
-    return {"ok": True, "conf": CONF_THRESH}
-
-@app.post("/detect")
-async def detect_face(
-    file: UploadFile = File(...),
-    x_api_key: str | None = Header(default=None),
-):
-    _check_api_key(x_api_key)
-
-    data = await file.read()
+# ---------- Core detection (shared by sync & queue) ----------
+def detect_faces_bytes(
+    data: bytes,
+    conf_thresh: float = CONF_THRESH,
+    max_bytes: int = MAX_BYTES
+) -> dict:
+    """Pure function for RQ worker & sync use. Returns dict with either
+       {'faces': int, 'is_face': True, 'status': 200}
+       or    {'error': 'message', 'status': <code>}"""
     if not data:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    if len(data) > MAX_BYTES:
-        raise HTTPException(status_code=413, detail=f"Image too large (max {MAX_BYTES // (1024*1024)} MB)")
-
-    # Decode (don’t trust content-type; HEIC supported if pillow-heif is present)
+        return {"error": "No file uploaded", "status": 400}
+    if len(data) > max_bytes:
+        return {"error": f"Image too large (max {max_bytes // (1024*1024)} MB)", "status": 413}
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img = Image.open(io.BytesIO(data)).convert("RGB")  # HEIC ok if pillow-heif installed
     except Exception:
-        raise HTTPException(status_code=400, detail="File is not a valid image")
+        return {"error": "File is not a valid image", "status": 400}
 
-    arr = np.array(img)  # HxWx3 RGB
+    arr = np.array(img)
     blob = cv2.dnn.blobFromImage(arr, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
-    net.setInput(blob)
-    detections = net.forward()  # shape [1,1,N,7]  => [id, conf, x1,y1,x2,y2]
+    NET.setInput(blob)
+    detections = NET.forward()  # [1,1,N,7] => [id, conf, x1, y1, x2, y2]
 
     count = 0
     for i in range(detections.shape[2]):
         conf = float(detections[0, 0, i, 2])
-        if conf >= CONF_THRESH:
+        if conf >= conf_thresh:
             count += 1
 
     if count == 0:
-        # Exact message required
-        raise HTTPException(status_code=422, detail="Upload a picture with your face")
+        return {"error": "Upload a picture with your face", "status": 422}
 
-    return {"faces": count, "is_face": True}
+    return {"faces": int(count), "is_face": True, "status": 200}
+
+# ---------- Queue helpers ----------
+def get_queue():
+    if not REDIS_URL:
+        return None
+    try:
+        conn = redis.from_url(REDIS_URL)
+        return Queue("facequeue", connection=conn, default_timeout=30)  # seconds per job
+    except Exception:
+        return None
+
+# ---------- Routes ----------
+@app.get("/health")
+def health():
+    return {"ok": True, "conf": CONF_THRESH, "queue": bool(get_queue())}
+
+# Synchronous detection (good for low traffic or as fail-safe)
+@app.post("/detect")
+async def detect_face_sync(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
+    data = await file.read()
+    result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
+    if result.get("error"):
+        raise HTTPException(status_code=result["status"], detail=result["error"])
+    return {"faces": result["faces"], "is_face": result["is_face"]}
+
+# Enqueue detection; returns job_id immediately
+@app.post("/detect_async")
+async def detect_face_async(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
+    q = get_queue()
+    data = await file.read()
+
+    if not q:
+        # Queue unavailable -> graceful sync fallback so users aren't stuck
+        result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
+        if result.get("error"):
+            raise HTTPException(status_code=result["status"], detail=result["error"])
+        return {"faces": result["faces"], "is_face": result["is_face"], "mode": "sync_fallback"}
+
+    # IMPORTANT: enqueue by string path so worker can import (module:function)
+    job = q.enqueue("app.detect_faces_bytes", data, kwargs={"conf_thresh": CONF_THRESH, "max_bytes": MAX_BYTES}, result_ttl=300, ttl=60)
+    return {"job_id": job.get_id(), "status": "queued"}
+
+# Poll job result
+@app.get("/result/{job_id}")
+def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
+    _check_api_key(x_api_key)
+    q = get_queue()
+    if not q:
+        raise HTTPException(503, "Queue unavailable")
+    job = q.fetch_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if not job.is_finished and not job.is_failed:
+        return {"status": "processing"}
+    if job.is_failed:
+        raise HTTPException(500, "Detection failed")
+    result = job.result
+    if result.get("error"):
+        raise HTTPException(status_code=result["status"], detail=result["error"])
+    return {"status": "done", "faces": result["faces"], "is_face": result["is_face"]}
