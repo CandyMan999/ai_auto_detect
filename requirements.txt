@@ -6,3 +6,5 @@ pillow-heif
 numpy
 opencv-python-headless
 gunicorn
+requests
+
