@@ -21,43 +21,16 @@ MAX_FRAMES      = int(os.getenv("MAX_FRAMES", "9"))                         # up
 UA = {"User-Agent": "nudity-service/1.0"}
 
 # Model placement (ONNX)
-MODEL_PATH = os.getenv("NUDENET_MODEL_PATH", "/app/models/nudenet.onnx")
-MODEL_URL  = os.getenv("NUDENET_MODEL_URL")  # direct https link to the 640m.onnx file
+# Absolute path to repo-root/models/640m.onnx (works locally & on Heroku)
+MODEL_PATH = str((pathlib.Path(__file__).parent / "models" / "640m.onnx").resolve())
+MODEL_URL = None  # we’re not downloading anything
 
 def _ensure_model() -> str:
-    """
-    Ensure ONNX model exists at MODEL_PATH. If missing and MODEL_URL is set, download it.
-    Returns absolute path to model.
-    """
     p = pathlib.Path(MODEL_PATH)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if p.exists() and p.stat().st_size > 1 * 1024 * 1024:  # >1MB sanity
+    if p.exists() and p.stat().st_size > 1 * 1024 * 1024:
         return str(p.resolve())
+    raise RuntimeError(f"ONNX model not found at {p}")
 
-    if not MODEL_URL:
-        raise RuntimeError("ONNX model missing and NUDENET_MODEL_URL not set")
-
-    # download with retries
-    for i in range(1, 5):
-        try:
-            with requests.get(MODEL_URL, stream=True, timeout=300, headers=UA, allow_redirects=True) as r:
-                r.raise_for_status()
-                with open(p, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1 << 20):
-                        if chunk:
-                            f.write(chunk)
-            if p.stat().st_size < 5 * 1024 * 1024:
-                raise RuntimeError(f"Downloaded model too small: {p.stat().st_size} bytes")
-            return str(p.resolve())
-        except Exception as e:
-            try:
-                if p.exists():
-                    p.unlink()
-            except Exception:
-                pass
-            if i == 4:
-                raise RuntimeError(f"Failed to download ONNX model: {e}")
-    return str(p.resolve())
 
 def _analyze(detection_results: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
     out = {"nudity_detected": False, "details": []}
@@ -84,8 +57,10 @@ def _download_video(url: str) -> str:
             total += len(chunk)
             if total > MAX_VIDEO_BYTES:
                 f.close()
-                try: os.unlink(f.name)
-                except Exception: pass
+                try:
+                    os.unlink(f.name)
+                except Exception:
+                    pass
                 raise RuntimeError(f"Video too large (> {MAX_VIDEO_BYTES // (1024*1024)} MB)")
             f.write(chunk)
         return f.name
@@ -129,12 +104,16 @@ def _extract_frames(video_path: str) -> List[str]:
 
 def _cleanup_files(files: List[str]):
     for p in files:
-        try: os.remove(p)
-        except Exception: pass
+        try:
+            os.remove(p)
+        except Exception:
+            pass
     # remove parent dirs if empty
     for d in {pathlib.Path(p).parent for p in files}:
-        try: os.rmdir(d)
-        except Exception: pass
+        try:
+            os.rmdir(d)
+        except Exception:
+            pass
 
 def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -155,7 +134,7 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
     vid = None
     frames: List[str] = []
     try:
-        # Ensure ONNX model available
+        # Ensure ONNX model available (or use explicit path)
         model_file = model_path if model_path else _ensure_model()
         detector = NudeDetector(model_path=model_file, inference_resolution=640)
 
@@ -185,7 +164,9 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
     finally:
         # Cleanup video + frames
         if vid and os.path.exists(vid):
-            try: os.remove(vid)
-            except Exception: pass
+            try:
+                os.remove(vid)
+            except Exception:
+                pass
         if frames:
             _cleanup_files(frames)
