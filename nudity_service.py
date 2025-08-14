@@ -1,6 +1,5 @@
 # nudity_service.py
 import os
-import math
 import cv2
 import requests
 import tempfile
@@ -19,18 +18,13 @@ NUDITY_TAGS = {
     "ANUS_EXPOSED",
 }
 THRESHOLD       = 0.5
-MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50 MB
-
-# Sampling: 1 frame every 0.5s, up to 60 frames
-TARGET_STEP_SEC = 0.5
-MAX_FRAMES      = 60
-
-# Inference resolution (like your original)
-INFER_RES       = 640
+MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 MB
+MAX_FRAMES      = 40                 # <= 40 frames, evenly spaced
+INFER_RES       = 512                # set to 640 if you prefer (slower)
 
 UA = {"User-Agent": "nudity-service/1.0"}
 
-# Model path (Heroku-friendly) + direct download URL
+# Model in Heroku's writable tmp + direct link (dl=1)
 MODEL_PATH = "/tmp/models/nudenet.onnx"
 MODEL_URL  = "https://www.dropbox.com/scl/fi/necew6rgmauez1pnpjyvq/640m.onnx?rlkey=cfu0sr4f6fk3gcrmrdu9u2otp&st=3ny9yqe4&dl=1"
 
@@ -78,7 +72,6 @@ def _ensure_model(override_path: Optional[str] = None) -> str:
 
     return str(dest.resolve())
 
-
 # --------------------------- Singleton detector ---------------------------
 
 _DETECTOR: Optional[NudeDetector] = None
@@ -116,22 +109,27 @@ def _download_video(url: str) -> str:
         print(f"[nudity] Video saved to {f.name} ({total} bytes)")
         return f.name
 
-def _adaptive_indices(total_frames: int, fps: float) -> List[int]:
+def _evenly_spaced_indices(total_frames: int, max_frames: int) -> List[int]:
     """
-    Choose up to MAX_FRAMES indices, ~1 every TARGET_STEP_SEC seconds,
-    evenly spread across the video (exclude exact endpoints).
+    Up to `max_frames` indices, evenly spaced across the timeline.
+    Prefers interior frames (avoids exact first/last), but falls back to stride if needed.
     """
     if total_frames <= 0:
         return []
-    fps = fps or 30.0
-    duration = total_frames / fps
-    desired = max(1, min(MAX_FRAMES, int(math.ceil(duration / TARGET_STEP_SEC))))
-    # Even spacing: (i+1)/(desired+1) of the timeline → avoids 0 and last frame
-    idxs = [int(round(total_frames * (i + 1) / (desired + 1))) for i in range(desired)]
-    # Unique & sorted, clamped to [0, total_frames-1]
-    idxs = sorted({max(0, min(total_frames - 1, i)) for i in idxs})
-    if not idxs:
-        idxs = [min(total_frames - 1, 0)]
+
+    want = min(max_frames, total_frames)
+    if want == 1:
+        return [total_frames // 2]
+
+    # Interior sampling: positions (i+1)/(want+1)
+    idxs = [int(round(total_frames * (i + 1) / (want + 1))) for i in range(want)]
+    idxs = sorted({max(0, min(total_frames - 1, x)) for x in idxs})
+
+    # If dedupe shrank too much (very short videos), fall back to stride across full range
+    if len(idxs) < min(want, total_frames):
+        step = max(1, total_frames // min(want, total_frames))
+        idxs = list(range(0, total_frames, step))[:min(want, total_frames)]
+
     return idxs
 
 def _analyze_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> List[Dict[str, Any]]:
@@ -152,7 +150,7 @@ def _analyze_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> L
 
 def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Download -> adaptively sample (≤60 frames, ~every 0.5s) -> per-frame detect -> summarize.
+    Download -> sample up to 40 evenly spaced frames -> per-frame detect -> summarize.
     """
     if not video_url or not isinstance(video_url, str):
         return {"error": "Missing video_url", "status": 400}
@@ -174,9 +172,10 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
             cap.release()
             return {"error": "No frames in video", "status": 400}
 
-        indices = _adaptive_indices(total, fps)
+        indices = _evenly_spaced_indices(total, MAX_FRAMES)
         print(f"[nudity] Analyzing {len(indices)} frames (fps={fps:.2f}, total_frames={total})")
 
+        # memory-safe: one frame at a time
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
@@ -186,7 +185,7 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
             os.close(fd)
             cv2.imwrite(frame_path, frame)
             try:
-                preds = detector.detect(frame_path)  # list[dict]
+                preds = detector.detect(frame_path)
                 hits.extend(_analyze_preds(idx, preds, fps))
             finally:
                 try: os.remove(frame_path)
