@@ -1,6 +1,7 @@
 # nudity_service.py
 import os
 import math
+import time
 import cv2
 import requests
 import tempfile
@@ -18,19 +19,22 @@ NUDITY_TAGS = {
     "MALE_GENITALIA_EXPOSED",
     "ANUS_EXPOSED",
 }
-THRESHOLD       = 0.5
-MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50 MB
+THRESHOLD         = 0.5
+MAX_VIDEO_BYTES   = 50 * 1024 * 1024  # 50 MB
 
-# Sampling: 1 frame every 0.5s, up to 60 frames
-TARGET_STEP_SEC = 0.5
-MAX_FRAMES      = 60
+# Target coverage: ~1 frame every 0.5s, up to 60 frames
+TARGET_STEP_SEC   = 0.5
+MAX_FRAMES        = 60
 
-# Inference resolution (like your original)
-INFER_RES       = 640
+# Hard time budget to avoid Heroku router timeout (keep < 30s)
+TIME_BUDGET_SEC   = 25.0
+WARMUP_FRAMES     = 4   # frames to time before auto-thinning
+
+# Resolution: a bit lighter to keep latency predictable
+INFER_RES         = 512  # use 640 if you really want, but 512 is safer on Hobby
 
 UA = {"User-Agent": "nudity-service/1.0"}
 
-# Model path (Heroku-friendly) + direct download URL
 MODEL_PATH = "/tmp/models/nudenet.onnx"
 MODEL_URL  = "https://www.dropbox.com/scl/fi/necew6rgmauez1pnpjyvq/640m.onnx?rlkey=cfu0sr4f6fk3gcrmrdu9u2otp&st=3ny9yqe4&dl=1"
 
@@ -49,6 +53,7 @@ def _ensure_model(override_path: Optional[str] = None) -> str:
             with requests.get(MODEL_URL, stream=True, timeout=300, headers=headers, allow_redirects=True) as r:
                 r.raise_for_status()
                 with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_iterable = r.iter_content  # silence type hints
                     for chunk in r.iter_content(chunk_size=1 << 20):
                         if chunk:
                             f.write(chunk)
@@ -102,23 +107,32 @@ def _download_video(url: str) -> str:
         print(f"[nudity] Video saved to {f.name} ({total} bytes)")
         return f.name
 
-def _adaptive_indices(total_frames: int, fps: float) -> List[int]:
-    """
-    Choose up to MAX_FRAMES indices, ~1 every TARGET_STEP_SEC seconds,
-    evenly spread across the video (exclude exact endpoints).
-    """
+def _target_indices(total_frames: int, fps: float) -> List[int]:
+    """Evenly spaced indices at ~TARGET_STEP_SEC, capped at MAX_FRAMES, excluding exact endpoints."""
     if total_frames <= 0:
         return []
     fps = fps or 30.0
     duration = total_frames / fps
     desired = max(1, min(MAX_FRAMES, int(math.ceil(duration / TARGET_STEP_SEC))))
-    # Even spacing: (i+1)/(desired+1) of the timeline → avoids 0 and last frame
+    # positions (i+1)/(desired+1): avoids 0 and last frame
     idxs = [int(round(total_frames * (i + 1) / (desired + 1))) for i in range(desired)]
-    # Unique & sorted, clamped to [0, total_frames-1]
     idxs = sorted({max(0, min(total_frames - 1, i)) for i in idxs})
-    if not idxs:
-        idxs = [min(total_frames - 1, 0)]
     return idxs
+
+def _thin_for_budget(remaining_idxs: List[int], processed: int, elapsed: float, avg_secs: float) -> List[int]:
+    """Given measured avg per-frame time, thin remaining indices to fit TIME_BUDGET_SEC."""
+    budget_left = max(0.0, TIME_BUDGET_SEC - elapsed)
+    if avg_secs <= 0:
+        return remaining_idxs
+    max_more = int(budget_left // avg_secs)
+    if max_more <= 0:
+        return []
+    if len(remaining_idxs) <= max_more:
+        return remaining_idxs
+    # keep roughly max_more items spread evenly
+    step = max(1, len(remaining_idxs) // max_more)
+    thinned = remaining_idxs[::step][:max_more]
+    return thinned
 
 def _analyze_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> List[Dict[str, Any]]:
     hits = []
@@ -138,7 +152,7 @@ def _analyze_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> L
 
 def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Download -> adaptively sample (≤60 frames, ~every 0.5s) -> per-frame detect -> summarize.
+    Download -> pick indices (~0.5s step, ≤60) -> per-frame detect with time-guard -> summarize.
     """
     if not video_url or not isinstance(video_url, str):
         return {"error": "Missing video_url", "status": 400}
@@ -146,6 +160,7 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
     vid_path: Optional[str] = None
     hits: List[Dict[str, Any]] = []
 
+    start = time.time()
     try:
         detector = _get_detector(model_path)
         vid_path = _download_video(video_url)
@@ -160,31 +175,69 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
             cap.release()
             return {"error": "No frames in video", "status": 400}
 
-        indices = _adaptive_indices(total, fps)
-        print(f"[nudity] Analyzing {len(indices)} frames (fps={fps:.2f}, total_frames={total})")
+        indices = _target_indices(total, fps)
+        print(f"[nudity] Planned frames: {len(indices)} (fps={fps:.2f}, total={total})")
 
-        for idx in indices:
+        processed = 0
+        elapsed = 0.0
+        avg_per_frame = None
+
+        i = 0
+        while i < len(indices):
+            idx = indices[i]
+
+            # hard time guard
+            elapsed = time.time() - start
+            if elapsed >= TIME_BUDGET_SEC:
+                print(f"[nudity] Time budget reached ({elapsed:.2f}s). Stopping early.")
+                break
+
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             if not ok or frame is None:
+                i += 1
                 continue
-            fd, frame_path = tempfile.mkstemp(suffix=".jpg", dir="/tmp")
-            os.close(fd)
+
+            t0 = time.time()
+            fd, frame_path = tempfile.mkstemp(suffix=".jpg", dir="/tmp"); os.close(fd)
             cv2.imwrite(frame_path, frame)
             try:
-                preds = detector.detect(frame_path)  # list[dict]
+                preds = detector.detect(frame_path)
                 hits.extend(_analyze_preds(idx, preds, fps))
             finally:
                 try: os.remove(frame_path)
                 except Exception: pass
+            t1 = time.time()
+
+            processed += 1
+            # maintain rolling avg after warmup
+            if processed <= WARMUP_FRAMES:
+                # simple avg over warmup
+                avg_per_frame = ((avg_per_frame or 0.0) * (processed - 1) + (t1 - t0)) / processed
+            else:
+                # exponential moving average to react to changes
+                alpha = 0.2
+                avg_per_frame = (1 - alpha) * (avg_per_frame or (t1 - t0)) + alpha * (t1 - t0)
+
+            # after warmup, re-thin remaining frames if needed
+            if processed == WARMUP_FRAMES:
+                remaining = indices[i+1:]
+                thinned = _thin_for_budget(remaining, processed, time.time() - start, avg_per_frame or 0.0)
+                if len(thinned) < len(remaining):
+                    print(f"[nudity] Auto-thinning remaining frames from {len(remaining)} -> {len(thinned)} to meet time budget.")
+                    indices = indices[:i+1] + thinned
+
+            i += 1
 
         cap.release()
 
         return {
             "status": 200,
             "nudity_detected": len(hits) > 0,
-            "details": hits,                  # frame index, timestamp, label, confidence
-            "frames_analyzed": len(indices),
+            "details": hits,                         # frame index, timestamp, label, confidence
+            "frames_analyzed": processed,
+            "planned_frames": len(indices),
+            "elapsed_sec": round(time.time() - start, 3),
         }
 
     except requests.HTTPError as he:
