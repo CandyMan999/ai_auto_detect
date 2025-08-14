@@ -1,12 +1,12 @@
 # nudity_service.py
 import os
-import cv2  # only for frame extraction; NOT used for model loading
+import cv2  # frame extraction only
 import requests
 import tempfile
 import pathlib
+import threading
 from typing import List, Dict, Any, Optional
 
-# NudeNet loads the ONNX if we pass model_path
 from nudenet import NudeDetector
 
 # --------------------------- Config ---------------------------
@@ -24,30 +24,33 @@ MAX_FRAMES       = int(os.getenv("MAX_FRAMES", "9"))                         # u
 
 UA = {"User-Agent": "nudity-service/1.0"}
 
-# Hardcoded model location + stable release URL
-MODEL_PATH = "/tmp/models/640m.onnx"  # /tmp is writable on Heroku
-MODEL_URL  = "https://www.dropbox.com/scl/fi/necew6rgmauez1pnpjyvq/640m.onnx?rlkey=cfu0sr4f6fk3gcrmrdu9u2otp&st=3ny9yqe4&dl=1"
+# Writable path on Heroku; will re-download on dyno restart
+MODEL_PATH = os.getenv("NUDENET_MODEL_PATH", "/tmp/models/nudenet.onnx")
+MODEL_URL  = os.getenv("NUDENET_MODEL_URL")  # e.g., your Dropbox direct link (dl=1)
 
 # --------------------------- Model ensure ---------------------------
 
 def _ensure_model(override_path: Optional[str] = None) -> str:
     """
-    Ensure the 640m.onnx exists locally. If missing, download from MODEL_URL
-    with proper headers and size sanity check.
+    Ensure the ONNX exists locally. If missing, download from MODEL_URL.
     Returns absolute path to the model file.
     """
     dest = pathlib.Path(override_path or MODEL_PATH)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    if dest.exists() and dest.stat().st_size > 50 * 1024 * 1024:  # > 50MB sanity
+    # If present and plausibly large (> 50MB), reuse it
+    if dest.exists() and dest.stat().st_size > 50 * 1024 * 1024:
         return str(dest.resolve())
 
-    # Download with headers + retries
+    if not MODEL_URL:
+        raise RuntimeError("NUDENET_MODEL_URL not set and model file missing")
+
     headers = {
         "Accept": "application/octet-stream",
         "User-Agent": UA["User-Agent"],
     }
 
+    tmp_path = dest.with_suffix(dest.suffix + ".part")
     for attempt in range(1, 5):
         try:
             print(f"[nudity] Downloading ONNX model to {dest} (attempt {attempt}) ...")
@@ -59,41 +62,59 @@ def _ensure_model(override_path: Optional[str] = None) -> str:
                 allow_redirects=True,
             ) as r:
                 r.raise_for_status()
-                with open(dest, "wb") as f:
+                with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):
                         if chunk:
                             f.write(chunk)
 
-            size = dest.stat().st_size
+            size = tmp_path.stat().st_size
             if size < 50 * 1024 * 1024:
-                # Too small -> probably HTML or error page; remove and retry
-                try:
-                    dest.unlink()
-                except Exception:
-                    pass
+                tmp_path.unlink(missing_ok=True)
                 raise RuntimeError(f"Downloaded model too small: {size} bytes")
 
+            tmp_path.replace(dest)
             print(f"[nudity] Model saved to {dest} ({size} bytes)")
             break
         except Exception as e:
             if attempt == 4:
                 raise RuntimeError(f"Failed to download ONNX model: {e}") from e
             print(f"[nudity] Download failed (attempt {attempt}), retrying...")
-
     return str(dest.resolve())
+
+# --------------------------- Singleton detector ---------------------------
+
+_DETECTOR: Optional[NudeDetector] = None
+_DETECTOR_LOCK = threading.Lock()
+_MODEL_FILE: Optional[str] = None
+
+def get_detector(override_path: Optional[str] = None) -> NudeDetector:
+    global _DETECTOR, _MODEL_FILE
+    if _DETECTOR is None:
+        with _DETECTOR_LOCK:
+            if _DETECTOR is None:
+                _MODEL_FILE = _ensure_model(override_path)
+                # Lower inference_resolution slightly to reduce RAM
+                _DETECTOR = NudeDetector(model_path=_MODEL_FILE, inference_resolution=512)
+                print(f"[nudity] NudeDetector initialized once with model {_MODEL_FILE}")
+    return _DETECTOR
 
 # --------------------------- Helpers ---------------------------
 
 def _analyze(detection_results: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """
+    Compatible with NudeNet outputs using either 'label' or legacy 'class' key.
+    """
     out = {"nudity_detected": False, "details": []}
     for frame_number, result in enumerate(detection_results or []):
         for det in result or []:
-            if det.get("class") in NUDITY_TAGS and float(det.get("score", 0.0)) >= THRESHOLD:
+            label = det.get("label", det.get("class"))
+            score = float(det.get("score", 0.0))
+            if label in NUDITY_TAGS and score >= THRESHOLD:
                 out["nudity_detected"] = True
                 out["details"].append({
                     "frame": frame_number,
-                    "type": det.get("class"),
-                    "confidence": float(det.get("score", 0.0)),
+                    "type": label,
+                    "confidence": score,
                 })
     return out
 
@@ -161,16 +182,12 @@ def _extract_frames(video_path: str) -> List[str]:
 
 def _cleanup_files(files: List[str], extra_paths: Optional[List[str]] = None):
     for p in files or []:
-        try:
-            os.remove(p)
-        except Exception:
-            pass
+        try: os.remove(p)
+        except Exception: pass
     # remove parent dirs if empty
     for d in {pathlib.Path(p).parent for p in files or []}:
-        try:
-            os.rmdir(d)
-        except Exception:
-            pass
+        try: os.rmdir(d)
+        except Exception: pass
     for p in extra_paths or []:
         try:
             if p and os.path.exists(p):
@@ -178,22 +195,11 @@ def _cleanup_files(files: List[str], extra_paths: Optional[List[str]] = None):
         except Exception:
             pass
 
-# --------------------------- Main entry ---------------------------
+# --------------------------- Public API ---------------------------
 
 def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Download video -> sample frames -> run NudeDetector(ONNX) -> analyze -> cleanup.
-
-    Returns on success:
-      {
-        "status": 200,
-        "nudity_detected": bool,
-        "details": [{frame, type, confidence}, ...],
-        "frames_analyzed": int
-      }
-
-    Returns on error:
-      {"error": "...", "status": <code>}
     """
     if not video_url or not isinstance(video_url, str):
         return {"error": "Missing video_url", "status": 400}
@@ -202,16 +208,14 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
     frame_paths: List[str] = []
 
     try:
-        # 1) Ensure the ONNX model exists locally (use override path if provided)
-        model_file = _ensure_model(model_path)
-        print(f"[nudity] Using model: {model_file}")
+        # 1) Get singleton detector (ensures model once)
+        detector = get_detector(model_path)
 
         # 2) Download video & 3) Extract frames
         vid_path = _download_video(video_url)
         frame_paths = _extract_frames(vid_path)
 
         # 4) Run detection (batch) with NudeNet ONNX
-        detector = NudeDetector(model_path=model_file, inference_resolution=640)
         results = detector.detect_batch(frame_paths)
 
         # 5) Summarize
@@ -234,3 +238,13 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
         return {"error": f"Detection failed: {e}", "status": 500}
     finally:
         _cleanup_files(frame_paths, extra_paths=[vid_path])
+
+def nudity_health() -> Dict[str, Any]:
+    """
+    Health/status for the nudity subsystem.
+    """
+    try:
+        det = get_detector()
+        return {"ok": True, "model": _MODEL_FILE or MODEL_PATH, "resolution": getattr(det, "inference_resolution", "unknown")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
