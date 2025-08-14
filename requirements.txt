@@ -5,16 +5,13 @@ requests==2.32.3
 pydantic==2.8.2
 python-multipart==0.0.9
 
-# vision stack
 opencv-python-headless==4.12.0.88
 numpy==2.0.2
 Pillow==10.4.0
 pillow-heif==0.18.0
 
-# queues (optional for /detect_async)
 redis==5.0.7
 rq==1.16.2
 
-# NudeNet + runtime
 nudenet==3.4.2
 onnxruntime==1.22.1
