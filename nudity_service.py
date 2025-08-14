@@ -11,34 +11,31 @@ from nudenet import NudeDetector
 
 # --------------------------- Config ---------------------------
 
+# Relevant NudeNet classes and score threshold
 NUDITY_TAGS = {
     "FEMALE_BREAST_EXPOSED",
     "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
     "ANUS_EXPOSED",
 }
-
-THRESHOLD            = float(os.getenv("NUDITY_THRESHOLD", "0.5"))
-MAX_VIDEO_BYTES      = int(os.getenv("MAX_VIDEO_BYTES", str(50 * 1024 * 1024)))  # 50MB
-
-# Sampling knobs (all overridable via request body too)
-SAMPLING_MODE        = os.getenv("SAMPLING_MODE", "uniform")  # uniform | stride | fps | deciles
-FRAME_STRIDE         = int(os.getenv("FRAME_STRIDE", "5"))    # used when SAMPLING_MODE=stride
-TARGET_FRAMES        = int(os.getenv("TARGET_FRAMES", "60"))  # used when SAMPLING_MODE=uniform
-SECONDS_STRIDE       = float(os.getenv("SECONDS_STRIDE", "0.5"))  # used when SAMPLING_MODE=fps (seconds between samples)
-MAX_SAMPLED_FRAMES   = int(os.getenv("MAX_SAMPLED_FRAMES", "120"))  # hard cap for safety
-
-INFER_RES            = int(os.getenv("INFER_RES", "512"))     # NudeNet inference resolution
+THRESHOLD       = 0.5
+MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50 MB
+SAMPLE_COUNT    = 10                 # analyze exactly 10 frames
+INFER_RES       = 640                # like your original
 
 UA = {"User-Agent": "nudity-service/1.0"}
 
-# Writable path on Heroku; re-downloads on dyno restart
-MODEL_PATH = os.getenv("NUDENET_MODEL_PATH", "/tmp/models/nudenet.onnx")
-MODEL_URL  = os.getenv("NUDENET_MODEL_URL")  # Dropbox/S3 direct link
+# Model location (Heroku-friendly: /tmp is writable)
+MODEL_PATH = "/tmp/models/nudenet.onnx"
+# Your Dropbox direct link (dl=1). Change if you host elsewhere.
+MODEL_URL  = "https://www.dropbox.com/scl/fi/necew6rgmauez1pnpjyvq/640m.onnx?rlkey=cfu0sr4f6fk3gcrmrdu9u2otp&st=3ny9yqe4&dl=1"
 
 # --------------------------- Model ensure ---------------------------
 
 def _ensure_model(override_path: Optional[str] = None) -> str:
+    """
+    Ensure the ONNX exists locally. If missing, download from MODEL_URL.
+    """
     dest = pathlib.Path(override_path or MODEL_PATH)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -46,12 +43,12 @@ def _ensure_model(override_path: Optional[str] = None) -> str:
         return str(dest.resolve())
 
     if not MODEL_URL:
-        raise RuntimeError("NUDENET_MODEL_URL not set and model file missing")
+        raise RuntimeError("Model URL missing")
 
     headers = {"Accept": "application/octet-stream", "User-Agent": UA["User-Agent"]}
     tmp_path = dest.with_suffix(dest.suffix + ".part")
 
-    for attempt in range(1, 5):
+    for attempt in range(1, 4):
         try:
             print(f"[nudity] Downloading ONNX model to {dest} (attempt {attempt}) ...")
             with requests.get(MODEL_URL, stream=True, timeout=300, headers=headers, allow_redirects=True) as r:
@@ -68,9 +65,9 @@ def _ensure_model(override_path: Optional[str] = None) -> str:
             print(f"[nudity] Model saved to {dest} ({size} bytes)")
             break
         except Exception as e:
-            if attempt == 4:
+            if attempt == 3:
                 raise RuntimeError(f"Failed to download ONNX model: {e}") from e
-            print(f"[nudity] Download failed (attempt {attempt}), retrying...")
+            print("[nudity] Download failed, retrying...")
     return str(dest.resolve())
 
 # --------------------------- Singleton detector ---------------------------
@@ -79,14 +76,14 @@ _DETECTOR: Optional[NudeDetector] = None
 _DETECTOR_LOCK = threading.Lock()
 _MODEL_FILE: Optional[str] = None
 
-def get_detector(override_path: Optional[str] = None) -> NudeDetector:
+def _get_detector(override_path: Optional[str] = None) -> NudeDetector:
     global _DETECTOR, _MODEL_FILE
     if _DETECTOR is None:
         with _DETECTOR_LOCK:
             if _DETECTOR is None:
                 _MODEL_FILE = _ensure_model(override_path)
                 _DETECTOR = NudeDetector(model_path=_MODEL_FILE, inference_resolution=INFER_RES)
-                print(f"[nudity] NudeDetector initialized once with model {_MODEL_FILE} (res={INFER_RES})")
+                print(f"[nudity] NudeDetector initialized (res={INFER_RES}) with model {_MODEL_FILE}")
     return _DETECTOR
 
 # --------------------------- Helpers ---------------------------
@@ -95,7 +92,6 @@ def _download_video(url: str) -> str:
     print(f"[nudity] Downloading video: {url}")
     r = requests.get(url, stream=True, timeout=300, headers=UA, allow_redirects=True)
     r.raise_for_status()
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp") as f:
         total = 0
         for chunk in r.iter_content(chunk_size=1 << 20):
@@ -106,56 +102,34 @@ def _download_video(url: str) -> str:
                 f.close()
                 try: os.unlink(f.name)
                 except Exception: pass
-                raise RuntimeError(f"Video too large (> {MAX_VIDEO_BYTES // (1024*1024)} MB)")
+                raise RuntimeError("Video too large (> 50 MB)")
             f.write(chunk)
         print(f"[nudity] Video saved to {f.name} ({total} bytes)")
         return f.name
 
-def _unique_sorted(ints: List[int]) -> List[int]:
-    return sorted(set(i for i in ints if i >= 0))
+def _ten_indices(total_frames: int) -> List[int]:
+    """
+    Pick 10 evenly spaced frames across the video (exclude very first/last).
+    Equivalent to ~5%, 15%, ..., 95%.
+    """
+    if total_frames <= 0:
+        return []
+    idxs = []
+    for i in range(SAMPLE_COUNT):
+        # positions from 1..SAMPLE_COUNT out of SAMPLE_COUNT+1 segments
+        pos = (i + 1) / (SAMPLE_COUNT + 1)
+        idx = int(round(total_frames * pos))
+        idx = max(0, min(total_frames - 1, idx))
+        idxs.append(idx)
+    # de-dup + sort
+    return sorted(set(idxs))
 
-def _indices_deciles(total: int) -> List[int]:
-    return [int(total * i / 10) for i in range(1, 10)]
-
-def _indices_uniform(total: int, target: int) -> List[int]:
-    target = max(1, min(target, total))
-    # spread across (not including 0 or last) similar to deciles but denser
-    return [int((i+1) * total / (target + 1)) for i in range(target)]
-
-def _indices_stride(total: int, stride: int) -> List[int]:
-    stride = max(1, stride)
-    return list(range(0, total, stride))
-
-def _indices_fps(total: int, fps: float, seconds_stride: float) -> List[int]:
-    step = max(1, int(round(fps * max(0.01, seconds_stride))))
-    return list(range(0, total, step))
-
-def _choose_indices(total_frames: int, fps: float,
-                    sampling_mode: str, frame_stride: int,
-                    target_frames: int, seconds_stride: float) -> List[int]:
-    mode = (sampling_mode or SAMPLING_MODE).lower()
-    if mode == "deciles":
-        idx = _indices_deciles(total_frames)
-    elif mode == "stride":
-        idx = _indices_stride(total_frames, frame_stride or FRAME_STRIDE)
-    elif mode == "fps":
-        idx = _indices_fps(total_frames, fps, seconds_stride or SECONDS_STRIDE)
-    else:  # "uniform" (default)
-        idx = _indices_uniform(total_frames, target_frames or TARGET_FRAMES)
-
-    idx = _unique_sorted(idx)
-    if MAX_SAMPLED_FRAMES > 0 and len(idx) > MAX_SAMPLED_FRAMES:
-        # uniformly thin to the cap
-        step = max(1, len(idx) // MAX_SAMPLED_FRAMES)
-        idx = idx[::step][:MAX_SAMPLED_FRAMES]
-    return idx
-
-def _analyze_frame_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float, threshold: float) -> List[Dict[str, Any]]:
+def _analyze_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> List[Dict[str, Any]]:
     hits = []
     for det in preds or []:
         label = det.get("label", det.get("class"))
         score = float(det.get("score", 0.0))
-        if label in NUDITY_TAGS and score >= threshold:
+        if label in NUDITY_TAGS and score >= THRESHOLD:
             hits.append({
                 "frame": frame_idx,
                 "time_sec": round(frame_idx / (fps or 30.0), 3),
@@ -166,27 +140,20 @@ def _analyze_frame_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float
 
 # --------------------------- Public API ---------------------------
 
-def process_video(
-    video_url: str,
-    model_path: Optional[str] = None,
-    sampling_mode: Optional[str] = None,
-    frame_stride: Optional[int] = None,
-    target_frames: Optional[int] = None,
-    seconds_stride: Optional[float] = None,
-    threshold: Optional[float] = None,
-) -> Dict[str, Any]:
-
+def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Download -> sample 10 frames -> per-frame detect -> summarize.
+    """
     if not video_url or not isinstance(video_url, str):
         return {"error": "Missing video_url", "status": 400}
 
     vid_path: Optional[str] = None
     hits: List[Dict[str, Any]] = []
-    thr = float(threshold if threshold is not None else THRESHOLD)
 
     try:
-        detector = get_detector(model_path)
-
+        detector = _get_detector(model_path)
         vid_path = _download_video(video_url)
+
         cap = cv2.VideoCapture(vid_path)
         if not cap.isOpened():
             return {"error": "Could not open video", "status": 400}
@@ -197,19 +164,10 @@ def process_video(
             cap.release()
             return {"error": "No frames in video", "status": 400}
 
-        indices = _choose_indices(
-            total_frames=total,
-            fps=fps,
-            sampling_mode=sampling_mode or SAMPLING_MODE,
-            frame_stride=frame_stride or FRAME_STRIDE,
-            target_frames=target_frames or TARGET_FRAMES,
-            seconds_stride=seconds_stride or SECONDS_STRIDE,
-        )
+        indices = _ten_indices(total)
+        print(f"[nudity] Analyzing {len(indices)} frames out of {total} (fps={fps:.2f})")
 
-        print(f"[nudity] Sampling mode={sampling_mode or SAMPLING_MODE}, "
-              f"indices={len(indices)}, fps={fps:.2f}, total_frames={total}")
-
-        # memory-safe loop per frame
+        # memory-safe: detect one frame at a time, no batch
         for idx in indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
@@ -219,8 +177,8 @@ def process_video(
             os.close(fd)
             cv2.imwrite(frame_path, frame)
             try:
-                preds = detector.detect(frame_path)
-                hits.extend(_analyze_frame_preds(idx, preds, fps, thr))
+                preds = detector.detect(frame_path)  # list[dict]
+                hits.extend(_analyze_preds(idx, preds, fps))
             finally:
                 try: os.remove(frame_path)
                 except Exception: pass
@@ -230,8 +188,8 @@ def process_video(
         return {
             "status": 200,
             "nudity_detected": len(hits) > 0,
-            "details": hits[:500],          # cap payload
-            "frames_analyzed": len(indices)
+            "details": hits,                  # includes frame idx + timestamp + type + confidence
+            "frames_analyzed": len(indices),
         }
 
     except requests.HTTPError as he:
@@ -251,11 +209,7 @@ def process_video(
 
 def nudity_health() -> Dict[str, Any]:
     try:
-        det = get_detector()
-        return {
-            "ok": True,
-            "model": _MODEL_FILE or MODEL_PATH,
-            "resolution": getattr(det, "inference_resolution", "unknown")
-        }
+        det = _get_detector()
+        return {"ok": True, "model": _MODEL_FILE or MODEL_PATH, "resolution": INFER_RES}
     except Exception as e:
         return {"ok": False, "error": str(e)}
