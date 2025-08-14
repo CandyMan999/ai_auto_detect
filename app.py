@@ -10,6 +10,7 @@ import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 
 # Queue (optional; used by /detect_async only)
 import redis
@@ -199,6 +200,11 @@ def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
 # ------------------------------------------------------------
 class NudityRequest(BaseModel):
     video_url: str
+    sampling_mode: Optional[str] = None      # "uniform" | "stride" | "fps" | "deciles"
+    frame_stride: Optional[int] = None       # used when sampling_mode="stride"
+    target_frames: Optional[int] = None      # used when sampling_mode="uniform"
+    seconds_stride: Optional[float] = None   # used when sampling_mode="fps"
+    threshold: Optional[float] = None        
 
 # Import after app definition to avoid any import-time side effects
 from nudity_service import process_video
@@ -206,13 +212,20 @@ from nudity_service import process_video
 @app.post("/nudity/detect")
 async def nudity_detect_sync(req: NudityRequest, x_api_key: str | None = Header(default=None)):
     _check_api_key(x_api_key)
-    # Optional override via env (defaults handled in nudity_service)
-    model_path = os.getenv("NUDENET_MODEL_PATH")
-    res = process_video(req.video_url, model_path=model_path)
+    model_path = os.getenv("NUDENET_MODEL_PATH")  # optional override
+    res = process_video(
+        video_url=req.video_url,
+        model_path=model_path,
+        sampling_mode=req.sampling_mode,
+        frame_stride=req.frame_stride,
+        target_frames=req.target_frames,
+        seconds_stride=req.seconds_stride,
+        threshold=req.threshold,
+    )
     if res.get("error"):
-        # Bubble up the exact error/status from the service
         raise HTTPException(status_code=res["status"], detail=res["error"])
     return res
+
 
 # ------------------------------------------------------------
 # Optional root
