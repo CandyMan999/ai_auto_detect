@@ -26,7 +26,7 @@ UA = {"User-Agent": "nudity-service/1.0"}
 
 # Hardcoded model location + stable release URL
 MODEL_PATH = "/tmp/models/640m.onnx"  # /tmp is writable on Heroku
-MODEL_URL  = "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx"
+MODEL_URL  = "https://www.dropbox.com/scl/fi/necew6rgmauez1pnpjyvq/640m.onnx?rlkey=cfu0sr4f6fk3gcrmrdu9u2otp&st=3ny9yqe4&dl=1"
 
 # --------------------------- Model ensure ---------------------------
 
