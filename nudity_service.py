@@ -1,173 +1,196 @@
-# app.py
-import io
+# nudity_service.py
 import os
-import time
-import pathlib
+import cv2  # frame extraction only
 import requests
-import numpy as np
-from PIL import Image
-import cv2
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import tempfile
+import pathlib
+import threading
+from typing import List, Dict, Any, Optional
 
-import redis
-from rq import Queue
+from nudenet import NudeDetector
 
-try:
-    from pillow_heif import register_heif_opener  # type: ignore
-    register_heif_opener()
-except Exception:
-    pass
+# --------------------------- Config ---------------------------
 
-MAX_BYTES       = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))
-CONF_THRESH     = float(os.getenv("FACE_CONF", "0.65"))
-REQUIRE_API_KEY = os.getenv("API_KEY")
-REDIS_URL       = os.getenv("REDIS_TLS_URL") or os.getenv("REDIS_URL")
+NUDITY_TAGS = {
+    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "ANUS_EXPOSED",
+}
 
-app = FastAPI(title="Face & Nudity Detection Service")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+THRESHOLD        = float(os.getenv("NUDITY_THRESHOLD", "0.5"))
+MAX_VIDEO_BYTES  = int(os.getenv("MAX_VIDEO_BYTES", str(50 * 1024 * 1024)))  # 50MB
+MAX_FRAMES       = int(os.getenv("MAX_FRAMES", "6"))  # fewer frames -> lower RAM
 
-def _check_api_key(x_api_key: str | None):
-    if REQUIRE_API_KEY and x_api_key != REQUIRE_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+UA = {"User-Agent": "nudity-service/1.0"}
 
-# ---- Face model ----
-MODEL_DIR = pathlib.Path("./face_model")
-MODEL_DIR.mkdir(exist_ok=True)
-PROTO_PATH   = MODEL_DIR / "deploy.prototxt"
-WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
-URL_PROTO   = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-URL_WEIGHTS = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-UA = {"User-Agent": "face-gate/1.0"}
+# Writable path on Heroku; re-downloads on dyno restart
+MODEL_PATH = os.getenv("NUDENET_MODEL_PATH", "/tmp/models/nudenet.onnx")
+MODEL_URL  = os.getenv("NUDENET_MODEL_URL")  # e.g., Dropbox direct link (?dl=1)
 
-def _download_with_retries(url: str, dest: pathlib.Path, attempts: int, min_bytes: int):
-    for i in range(1, attempts + 1):
+# --------------------------- Model ensure ---------------------------
+
+def _ensure_model(override_path: Optional[str] = None) -> str:
+    dest = pathlib.Path(override_path or MODEL_PATH)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists() and dest.stat().st_size > 50 * 1024 * 1024:
+        return str(dest.resolve())
+
+    if not MODEL_URL:
+        raise RuntimeError("NUDENET_MODEL_URL not set and model file missing")
+
+    headers = {"Accept": "application/octet-stream", "User-Agent": UA["User-Agent"]}
+    tmp_path = dest.with_suffix(dest.suffix + ".part")
+
+    for attempt in range(1, 5):
         try:
-            with requests.get(url, timeout=90, stream=True, headers=UA, allow_redirects=True) as r:
+            print(f"[nudity] Downloading ONNX model to {dest} (attempt {attempt}) ...")
+            with requests.get(MODEL_URL, stream=True, timeout=300, headers=headers, allow_redirects=True) as r:
                 r.raise_for_status()
-                with open(dest, "wb") as f:
+                with open(tmp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):
-                        if chunk: f.write(chunk)
-            if dest.stat().st_size < min_bytes:
-                raise RuntimeError(f"Downloaded file too small: {dest} ({dest.stat().st_size} bytes)")
-            return
-        except Exception:
-            if dest.exists():
-                try: dest.unlink()
+                        if chunk:
+                            f.write(chunk)
+            size = tmp_path.stat().st_size
+            if size < 50 * 1024 * 1024:
+                tmp_path.unlink(missing_ok=True)
+                raise RuntimeError(f"Downloaded model too small: {size} bytes")
+            tmp_path.replace(dest)
+            print(f"[nudity] Model saved to {dest} ({size} bytes)")
+            break
+        except Exception as e:
+            if attempt == 4:
+                raise RuntimeError(f"Failed to download ONNX model: {e}") from e
+            print(f"[nudity] Download failed (attempt {attempt}), retrying...")
+    return str(dest.resolve())
+
+# --------------------------- Singleton detector ---------------------------
+
+_DETECTOR: Optional[NudeDetector] = None
+_DETECTOR_LOCK = threading.Lock()
+_MODEL_FILE: Optional[str] = None
+
+def get_detector(override_path: Optional[str] = None) -> NudeDetector:
+    global _DETECTOR, _MODEL_FILE
+    if _DETECTOR is None:
+        with _DETECTOR_LOCK:
+            if _DETECTOR is None:
+                _MODEL_FILE = _ensure_model(override_path)
+                # Lower res to reduce RAM. Try 416 if you still push limits.
+                _DETECTOR = NudeDetector(model_path=_MODEL_FILE, inference_resolution=512)
+                print(f"[nudity] NudeDetector initialized once with model {_MODEL_FILE}")
+    return _DETECTOR
+
+# --------------------------- Helpers ---------------------------
+
+def _analyze_frame_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> List[Dict[str, Any]]:
+    hits = []
+    for det in preds or []:
+        label = det.get("label", det.get("class"))
+        score = float(det.get("score", 0.0))
+        if label in NUDITY_TAGS and score >= THRESHOLD:
+            hits.append({
+                "frame": frame_idx,
+                "time_sec": round(frame_idx / (fps or 30.0), 3),
+                "type": label,
+                "confidence": score,
+            })
+    return hits
+
+def _download_video(url: str) -> str:
+    print(f"[nudity] Downloading video: {url}")
+    r = requests.get(url, stream=True, timeout=300, headers=UA, allow_redirects=True)
+    r.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp") as f:
+        total = 0
+        for chunk in r.iter_content(chunk_size=1 << 20):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_VIDEO_BYTES:
+                f.close()
+                try: os.unlink(f.name)
                 except Exception: pass
-            if i == attempts:
-                raise
-            time.sleep(1.5 * i)
+                raise RuntimeError(f"Video too large (> {MAX_VIDEO_BYTES // (1024*1024)} MB)")
+            f.write(chunk)
+        print(f"[nudity] Video saved to {f.name} ({total} bytes)")
+        return f.name
 
-def ensure_face_model():
-    if not PROTO_PATH.exists():
-        _download_with_retries(URL_PROTO, PROTO_PATH, attempts=4, min_bytes=1 * 1024)
-    if not WEIGHTS_PATH.exists():
-        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH, attempts=4, min_bytes=5 * 1024 * 1024)
+def _frame_indices(total_frames: int) -> List[int]:
+    # 10%, 20%, ..., 90%, capped by MAX_FRAMES
+    indices = [int(total_frames * i / 10) for i in range(1, 10)]
+    return indices[:MAX_FRAMES]
 
-ensure_face_model()
-NET = cv2.dnn.readNetFromCaffe(str(PROTO_PATH), str(WEIGHTS_PATH))
+# --------------------------- Public API ---------------------------
 
-def detect_faces_bytes(data: bytes, conf_thresh: float = CONF_THRESH, max_bytes: int = MAX_BYTES) -> dict:
-    if not data:
-        return {"error": "No file uploaded", "status": 400}
-    if len(data) > max_bytes:
-        return {"error": f"Image too large (max {max_bytes // (1024*1024)} MB)", "status": 413}
+def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
+    if not video_url or not isinstance(video_url, str):
+        return {"error": "Missing video_url", "status": 400}
+
+    vid_path: Optional[str] = None
+    hits: List[Dict[str, Any]] = []
+
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception:
-        return {"error": "File is not a valid image", "status": 400}
+        detector = get_detector(model_path)
 
-    arr = np.array(img)
-    blob = cv2.dnn.blobFromImage(arr, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
-    NET.setInput(blob)
-    detections = NET.forward()
+        vid_path = _download_video(video_url)
+        cap = cv2.VideoCapture(vid_path)
+        if not cap.isOpened():
+            return {"error": "Could not open video", "status": 400}
 
-    count = 0
-    for i in range(detections.shape[2]):
-        conf = float(detections[0, 0, i, 2])
-        if conf >= conf_thresh:
-            count += 1
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            cap.release()
+            return {"error": "No frames in video", "status": 400}
 
-    if count == 0:
-        return {"error": "Upload a picture with your face", "status": 422}
+        indices = _frame_indices(total)
 
-    return {"faces": int(count), "is_face": True, "status": 200}
+        # detect per frame (memory-safe)
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            fd, frame_path = tempfile.mkstemp(suffix=".jpg", dir="/tmp")
+            os.close(fd)
+            cv2.imwrite(frame_path, frame)
+            try:
+                preds = detector.detect(frame_path)
+                hits.extend(_analyze_frame_preds(idx, preds, fps))
+            finally:
+                try: os.remove(frame_path)
+                except Exception: pass
 
-def get_queue():
-    if not REDIS_URL:
-        return None
+        cap.release()
+
+        return {
+            "status": 200,
+            "nudity_detected": len(hits) > 0,
+            "details": hits[:200],
+            "frames_analyzed": len(indices),
+        }
+
+    except requests.HTTPError as he:
+        return {"error": f"Download failed: {he}", "status": 400}
+    except RuntimeError as re:
+        msg = str(re)
+        code = 413 if "too large" in msg.lower() else 400
+        return {"error": msg, "status": code}
+    except Exception as e:
+        return {"error": f"Detection failed: {e}", "status": 500}
+    finally:
+        try:
+            if vid_path and os.path.exists(vid_path):
+                os.remove(vid_path)
+        except Exception:
+            pass
+
+def nudity_health() -> Dict[str, Any]:
     try:
-        conn = redis.from_url(REDIS_URL, ssl_cert_reqs=None)
-        return Queue("facequeue", connection=conn, default_timeout=30)
-    except Exception:
-        return None
-
-@app.get("/health")
-def health():
-    from nudity_service import nudity_health
-    return {"ok": True, "conf": CONF_THRESH, "queue": bool(get_queue()), "nudity": nudity_health()}
-
-@app.post("/detect")
-async def detect_face_sync(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
-    _check_api_key(x_api_key)
-    data = await file.read()
-    result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
-    if result.get("error"):
-        raise HTTPException(status_code=result["status"], detail=result["error"])
-    return {"faces": result["faces"], "is_face": result["is_face"]}
-
-@app.post("/detect_async")
-async def detect_face_async(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
-    _check_api_key(x_api_key)
-    q = get_queue()
-    data = await file.read()
-
-    if not q:
-        result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
-        if result.get("error"):
-            raise HTTPException(status_code=result["status"], detail=result["error"])
-        return {"faces": result["faces"], "is_face": result["is_face"], "mode": "sync_fallback"}
-
-    job = q.enqueue("app.detect_faces_bytes", data, kwargs={"conf_thresh": CONF_THRESH, "max_bytes": MAX_BYTES}, result_ttl=300, ttl=60)
-    return {"job_id": job.get_id(), "status": "queued"}
-
-@app.get("/result/{job_id}")
-def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
-    _check_api_key(x_api_key)
-    q = get_queue()
-    if not q:
-        raise HTTPException(503, "Queue unavailable")
-    job = q.fetch_job(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    if not job.is_finished and not job.is_failed:
-        return {"status": "processing"}
-    if job.is_failed:
-        raise HTTPException(500, "Detection failed")
-    result = job.result
-    if result.get("error"):
-        raise HTTPException(status_code=result["status"], detail=result["error"])
-    return {"status": "done", "faces": result["faces"], "is_face": result["is_face"]}
-
-# ---- Nudity ----
-class NudityRequest(BaseModel):
-    video_url: str
-
-from nudity_service import process_video  # after FastAPI defined
-
-@app.post("/nudity/detect")
-async def nudity_detect_sync(req: NudityRequest, x_api_key: str | None = Header(default=None)):
-    _check_api_key(x_api_key)
-    model_path = os.getenv("NUDENET_MODEL_PATH")  # optional override
-    res = process_video(req.video_url, model_path=model_path)
-    if res.get("error"):
-        raise HTTPException(status_code=res["status"], detail=res["error"])
-    return res
+        det = get_detector()
+        return {"ok": True, "model": _MODEL_FILE or MODEL_PATH, "resolution": getattr(det, "inference_resolution", "unknown")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
