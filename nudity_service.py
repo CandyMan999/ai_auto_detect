@@ -4,25 +4,60 @@ import cv2
 import requests
 import tempfile
 import pathlib
-
 from typing import List, Dict, Any, Optional
 
-# NudeNet imported only when used
-from nudenet import NudeDetector
+from nudenet import NudeDetector  # uses provided ONNX if model_path is passed
 
-# Match your original tags/threshold
+# Detection settings
 NUDITY_TAGS = {
     "FEMALE_BREAST_EXPOSED",
     "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
     "ANUS_EXPOSED",
 }
-THRESHOLD = float(os.getenv("NUDITY_THRESHOLD", "0.5"))
-
+THRESHOLD       = float(os.getenv("NUDITY_THRESHOLD", "0.5"))
 MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_BYTES", str(50 * 1024 * 1024)))  # 50MB cap
-MAX_FRAMES = int(os.getenv("MAX_FRAMES", "9"))  # 10%,20%,...,90% = 9 frames
-
+MAX_FRAMES      = int(os.getenv("MAX_FRAMES", "9"))                         # up to 9 frames (10..90%)
 UA = {"User-Agent": "nudity-service/1.0"}
+
+# Model placement (ONNX)
+MODEL_PATH = os.getenv("NUDENET_MODEL_PATH", "/app/models/nudenet.onnx")
+MODEL_URL  = os.getenv("NUDENET_MODEL_URL")  # direct https link to the 640m.onnx file
+
+def _ensure_model() -> str:
+    """
+    Ensure ONNX model exists at MODEL_PATH. If missing and MODEL_URL is set, download it.
+    Returns absolute path to model.
+    """
+    p = pathlib.Path(MODEL_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists() and p.stat().st_size > 1 * 1024 * 1024:  # >1MB sanity
+        return str(p.resolve())
+
+    if not MODEL_URL:
+        raise RuntimeError("ONNX model missing and NUDENET_MODEL_URL not set")
+
+    # download with retries
+    for i in range(1, 5):
+        try:
+            with requests.get(MODEL_URL, stream=True, timeout=300, headers=UA, allow_redirects=True) as r:
+                r.raise_for_status()
+                with open(p, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+            if p.stat().st_size < 5 * 1024 * 1024:
+                raise RuntimeError(f"Downloaded model too small: {p.stat().st_size} bytes")
+            return str(p.resolve())
+        except Exception as e:
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+            if i == 4:
+                raise RuntimeError(f"Failed to download ONNX model: {e}")
+    return str(p.resolve())
 
 def _analyze(detection_results: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
     out = {"nudity_detected": False, "details": []}
@@ -38,9 +73,10 @@ def _analyze(detection_results: List[List[Dict[str, Any]]]) -> Dict[str, Any]:
     return out
 
 def _download_video(url: str) -> str:
-    r = requests.get(url, stream=True, timeout=180, headers=UA, allow_redirects=True)
+    r = requests.get(url, stream=True, timeout=300, headers=UA, allow_redirects=True)
     r.raise_for_status()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
+    # Heroku-safe temp file in /tmp
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir="/tmp") as f:
         total = 0
         for chunk in r.iter_content(chunk_size=1 << 20):
             if not chunk:
@@ -48,42 +84,50 @@ def _download_video(url: str) -> str:
             total += len(chunk)
             if total > MAX_VIDEO_BYTES:
                 f.close()
-                os.unlink(f.name)
-                raise ValueError(f"Video too large (max {MAX_VIDEO_BYTES // (1024*1024)} MB)")
+                try: os.unlink(f.name)
+                except Exception: pass
+                raise RuntimeError(f"Video too large (> {MAX_VIDEO_BYTES // (1024*1024)} MB)")
             f.write(chunk)
         return f.name
 
-def _extract_frames(video_path: str, total_frames: Optional[int] = None) -> List[str]:
+def _extract_frames(video_path: str) -> List[str]:
+    """
+    Extract up to MAX_FRAMES frames at ~10..90% of the video.
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise ValueError("Could not open video")
+        raise RuntimeError("Could not open video")
 
-    if total_frames is None:
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    if total_frames <= 0:
-        total_frames = 100  # fallback
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if total <= 0:
+        cap.release()
+        raise RuntimeError("No frames in video")
 
-    # 10%, 20%, ..., 90%
-    indices = [int(total_frames * i / 10) for i in range(1, 10)]
-
-    tmpdir = tempfile.mkdtemp(prefix="frames_")
+    # target frame indices ~10%, 20%, ..., 90%
+    indices = [int(total * i / 10) for i in range(1, 10)]
+    frames_dir = tempfile.mkdtemp(dir="/tmp", prefix="frames_")
     paths: List[str] = []
+
     try:
         for i, idx in enumerate(indices):
+            if len(paths) >= MAX_FRAMES:
+                break
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
-            p = os.path.join(tmpdir, f"frame_{i}.jpg")
+            p = os.path.join(frames_dir, f"frame_{i}.jpg")
             cv2.imwrite(p, frame)
             paths.append(p)
-            if len(paths) >= MAX_FRAMES:
-                break
     finally:
         cap.release()
+
+    if not paths:
+        raise RuntimeError("Failed to extract frames")
+
     return paths
 
-def _cleanup(files: List[str]):
+def _cleanup_files(files: List[str]):
     for p in files:
         try: os.remove(p)
         except Exception: pass
@@ -94,9 +138,16 @@ def _cleanup(files: List[str]):
 
 def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    Pure function used by FastAPI sync route or RQ worker.
-    Mirrors your working script: download -> sample frames -> detect_batch -> analyze -> cleanup.
-    Returns dict; on error includes {"error": "...", "status": <code>}
+    Download video -> sample frames -> run NudeDetector(ONNX) -> analyze -> cleanup.
+    Returns:
+      {
+        "status": 200,
+        "nudity_detected": bool,
+        "details": [{frame, type, confidence}, ...],
+        "frames_analyzed": int
+      }
+    On error:
+      {"error": "...", "status": <code>}
     """
     if not video_url or not isinstance(video_url, str):
         return {"error": "Missing video_url", "status": 400}
@@ -104,19 +155,17 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
     vid = None
     frames: List[str] = []
     try:
+        # Ensure ONNX model available
+        model_file = model_path if model_path else _ensure_model()
+        detector = NudeDetector(model_path=model_file, inference_resolution=640)
+
+        # Download video & extract frames
         vid = _download_video(video_url)
         frames = _extract_frames(vid)
-        if not frames:
-            return {"error": "No frames extracted", "status": 400}
 
-        # Same as your code: prefer supplied ONNX path, else NudeNet default
-        if model_path:
-            detector = NudeDetector(model_path=model_path, inference_resolution=640)
-        else:
-            detector = NudeDetector()  # default model
-
-        batch = detector.detect_batch(frames)
-        summary = _analyze(batch)
+        # Run detection (batch)
+        results = detector.detect_batch(frames)
+        summary = _analyze(results)
 
         return {
             "status": 200,
@@ -126,13 +175,17 @@ def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str,
         }
     except requests.HTTPError as he:
         return {"error": f"Download failed: {he}", "status": 400}
-    except ValueError as ve:
-        return {"error": str(ve), "status": 413 if "too large" in str(ve).lower() else 400}
+    except RuntimeError as re:
+        # Use 413 for size errors, else 400
+        msg = str(re)
+        code = 413 if "too large" in msg.lower() else 400
+        return {"error": msg, "status": code}
     except Exception as e:
         return {"error": f"Detection failed: {e}", "status": 500}
     finally:
+        # Cleanup video + frames
         if vid and os.path.exists(vid):
             try: os.remove(vid)
             except Exception: pass
         if frames:
-            _cleanup(frames)
+            _cleanup_files(frames)

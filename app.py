@@ -10,31 +10,29 @@ import cv2
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from nudity_service import process_video
 
-
-# Queue (optional but recommended for bursts)
+# Queue (optional; used by /detect_async only)
 import redis
 from rq import Queue
 
-# ---------- Optional HEIC/HEIF support (iPhone) ----------
+# iPhone HEIC/HEIF support
 try:
     from pillow_heif import register_heif_opener  # type: ignore
     register_heif_opener()
 except Exception:
     pass
 
-# ---------- Config ----------
-MAX_BYTES   = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB default
-CONF_THRESH = float(os.getenv("FACE_CONF", "0.65"))               # 0.5 permissive … 0.8 strict
-REQUIRE_API_KEY = os.getenv("API_KEY")                            # if set, require x-api-key
-REDIS_URL = os.getenv("REDIS_TLS_URL") or os.getenv("REDIS_URL")                              # set by Heroku Redis
+# ---------- Config (ENV) ----------
+MAX_BYTES       = int(os.getenv("MAX_BYTES", str(10 * 1024 * 1024)))   # face image max bytes
+CONF_THRESH     = float(os.getenv("FACE_CONF", "0.65"))                # face detector confidence
+REQUIRE_API_KEY = os.getenv("API_KEY")                                 # optional; if set, require x-api-key
+REDIS_URL       = os.getenv("REDIS_TLS_URL") or os.getenv("REDIS_URL") # optional; for /detect_async
 
-# ---------- FastAPI App + CORS ----------
-app = FastAPI(title="Face Gate (OpenCV DNN + Queue)")
+# ---------- FastAPI + CORS ----------
+app = FastAPI(title="Face & Nudity Detection Service")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your domains later
+    allow_origins=["*"],   # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,16 +42,16 @@ def _check_api_key(x_api_key: str | None):
     if REQUIRE_API_KEY and x_api_key != REQUIRE_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-# ---------- Model download & load (robust) ----------
+# ---------- Face model (OpenCV DNN) ----------
 MODEL_DIR = pathlib.Path("./face_model")
 MODEL_DIR.mkdir(exist_ok=True)
 
-PROTO_PATH   = MODEL_DIR / "deploy.prototxt"                               # ~30–40 KB
-WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"      # ~10–11 MB
+PROTO_PATH   = MODEL_DIR / "deploy.prototxt"
+WEIGHTS_PATH = MODEL_DIR / "res10_300x300_ssd_iter_140000.caffemodel"
 
 URL_PROTO   = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
 URL_WEIGHTS = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-UA = {"User-Agent": "face-gate/1.0"}  # helps with some CDNs
+UA = {"User-Agent": "face-gate/1.0"}
 
 def _download_with_retries(url: str, dest: pathlib.Path, attempts: int, min_bytes: int):
     for i in range(1, attempts + 1):
@@ -73,41 +71,32 @@ def _download_with_retries(url: str, dest: pathlib.Path, attempts: int, min_byte
                 except Exception: pass
             if i == attempts:
                 raise
-            time.sleep(1.5 * i)  # backoff
+            time.sleep(1.5 * i)
 
 def ensure_face_model():
     if not PROTO_PATH.exists():
-        _download_with_retries(URL_PROTO, PROTO_PATH, attempts=4, min_bytes=1 * 1024)         # >1 KB
+        _download_with_retries(URL_PROTO, PROTO_PATH, attempts=4, min_bytes=1 * 1024)
     if not WEIGHTS_PATH.exists():
-        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH, attempts=4, min_bytes=5 * 1024 * 1024)  # >5 MB
+        _download_with_retries(URL_WEIGHTS, WEIGHTS_PATH, attempts=4, min_bytes=5 * 1024 * 1024)
 
 ensure_face_model()
-
-# Load once per process
 NET = cv2.dnn.readNetFromCaffe(str(PROTO_PATH), str(WEIGHTS_PATH))
 
-# ---------- Core detection (shared by sync & queue) ----------
-def detect_faces_bytes(
-    data: bytes,
-    conf_thresh: float = CONF_THRESH,
-    max_bytes: int = MAX_BYTES
-) -> dict:
-    """Pure function for RQ worker & sync use. Returns dict with either
-       {'faces': int, 'is_face': True, 'status': 200}
-       or    {'error': 'message', 'status': <code>}"""
+# ---------- Face detection core ----------
+def detect_faces_bytes(data: bytes, conf_thresh: float = CONF_THRESH, max_bytes: int = MAX_BYTES) -> dict:
     if not data:
         return {"error": "No file uploaded", "status": 400}
     if len(data) > max_bytes:
         return {"error": f"Image too large (max {max_bytes // (1024*1024)} MB)", "status": 413}
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")  # HEIC ok if pillow-heif installed
+        img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
         return {"error": "File is not a valid image", "status": 400}
 
     arr = np.array(img)
     blob = cv2.dnn.blobFromImage(arr, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=True, crop=False)
     NET.setInput(blob)
-    detections = NET.forward()  # [1,1,N,7] => [id, conf, x1, y1, x2, y2]
+    detections = NET.forward()  # [1,1,N,7]
 
     count = 0
     for i in range(detections.shape[2]):
@@ -120,22 +109,21 @@ def detect_faces_bytes(
 
     return {"faces": int(count), "is_face": True, "status": 200}
 
-# ---------- Queue helpers ----------
+# ---------- Queue helpers (face async) ----------
 def get_queue():
     if not REDIS_URL:
         return None
     try:
-        conn = redis.from_url(REDIS_URL)
-        return Queue("facequeue", connection=conn, default_timeout=30)  # seconds per job
+        conn = redis.from_url(REDIS_URL, ssl_cert_reqs=None)  # Heroku Redis over TLS
+        return Queue("facequeue", connection=conn, default_timeout=30)
     except Exception:
         return None
 
-# ---------- Routes ----------
+# ---------- Routes (face) ----------
 @app.get("/health")
 def health():
     return {"ok": True, "conf": CONF_THRESH, "queue": bool(get_queue())}
 
-# Synchronous detection (good for low traffic or as fail-safe)
 @app.post("/detect")
 async def detect_face_sync(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
     _check_api_key(x_api_key)
@@ -145,7 +133,6 @@ async def detect_face_sync(file: UploadFile = File(...), x_api_key: str | None =
         raise HTTPException(status_code=result["status"], detail=result["error"])
     return {"faces": result["faces"], "is_face": result["is_face"]}
 
-# Enqueue detection; returns job_id immediately
 @app.post("/detect_async")
 async def detect_face_async(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
     _check_api_key(x_api_key)
@@ -153,17 +140,14 @@ async def detect_face_async(file: UploadFile = File(...), x_api_key: str | None 
     data = await file.read()
 
     if not q:
-        # Queue unavailable -> graceful sync fallback so users aren't stuck
         result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
         if result.get("error"):
             raise HTTPException(status_code=result["status"], detail=result["error"])
         return {"faces": result["faces"], "is_face": result["is_face"], "mode": "sync_fallback"}
 
-    # IMPORTANT: enqueue by string path so worker can import (module:function)
     job = q.enqueue("app.detect_faces_bytes", data, kwargs={"conf_thresh": CONF_THRESH, "max_bytes": MAX_BYTES}, result_ttl=300, ttl=60)
     return {"job_id": job.get_id(), "status": "queued"}
 
-# Poll job result
 @app.get("/result/{job_id}")
 def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
     _check_api_key(x_api_key)
@@ -182,30 +166,17 @@ def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=result["status"], detail=result["error"])
     return {"status": "done", "faces": result["faces"], "is_face": result["is_face"]}
 
+# ---------- Nudity (single route) ----------
 class NudityRequest(BaseModel):
     video_url: str
+
+from nudity_service import process_video  # after FastAPI defined
 
 @app.post("/nudity/detect")
 async def nudity_detect_sync(req: NudityRequest, x_api_key: str | None = Header(default=None)):
     _check_api_key(x_api_key)
-    model_path = os.getenv("NUDENET_MODEL_PATH")  # optional
-    res = process_video(req.video_url, model_path=model_path)
+    # If you set NUDENET_MODEL_PATH/URL, nudity_service will ensure model exists
+    res = process_video(req.video_url, model_path=os.getenv("NUDENET_MODEL_PATH"))
     if res.get("error"):
-        raise HTTPException(status_code=res["status"], detail=res["error"])
+        raise HTTPException(status_code=res.get("status", 500), detail=res["error"])
     return res
-
-@app.post("/nudity/detect_async")
-async def nudity_detect_async(req: NudityRequest, x_api_key: str | None = Header(default=None)):
-    _check_api_key(x_api_key)
-    q = get_queue()
-    if not q:
-        # graceful fallback
-        model_path = os.getenv("NUDENET_MODEL_PATH")
-        res = process_video(req.video_url, model_path=model_path)
-        if res.get("error"):
-            raise HTTPException(status_code=res["status"], detail=res["error"])
-        return {**res, "mode": "sync_fallback"}
-
-    # pass model_path explicitly so worker doesn't rely on env if you don't want to
-    job = q.enqueue("nudity_service.process_video", req.video_url, os.getenv("NUDENET_MODEL_PATH"), result_ttl=600, ttl=120)
-    return {"job_id": job.get_id(), "status": "queued"}
