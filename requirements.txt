@@ -1,15 +1,16 @@
 fastapi
 uvicorn[standard]
 gunicorn
-opencv-python-headless
 numpy
 Pillow
 python-multipart
-requests
 pillow-heif
 redis
 rq
-nudenet
-onnxruntime
-nudenet
+onnxruntime==1.18.1
+nudenet==3.4.2
+opencv-python-headless==4.9.0.80
+requests
+pillow
+
 

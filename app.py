@@ -175,8 +175,9 @@ from nudity_service import process_video  # after FastAPI defined
 @app.post("/nudity/detect")
 async def nudity_detect_sync(req: NudityRequest, x_api_key: str | None = Header(default=None)):
     _check_api_key(x_api_key)
-    # If you set NUDENET_MODEL_PATH/URL, nudity_service will ensure model exists
-    res = process_video(req.video_url, model_path=os.getenv("NUDENET_MODEL_PATH"))
+    model_path = os.getenv("NUDENET_MODEL_PATH")  # optional
+    res = process_video(req.video_url, model_path=model_path)
     if res.get("error"):
-        raise HTTPException(status_code=res.get("status", 500), detail=res["error"])
+        # return the real error so the client sees it
+        raise HTTPException(status_code=res["status"], detail=res["error"])
     return res
