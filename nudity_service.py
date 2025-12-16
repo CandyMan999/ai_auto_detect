@@ -18,7 +18,7 @@ NUDITY_TAGS = {
     "ANUS_EXPOSED",
 }
 THRESHOLD       = 0.5
-MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 MB
+MAX_VIDEO_BYTES = 200 * 1024 * 1024   # 50 MB
 MAX_FRAMES      = 40                 # <= 40 frames, evenly spaced
 INFER_RES       = 512                # set to 640 if you prefer (slower)
 
