@@ -126,7 +126,12 @@ def detect_faces_bytes(data: bytes, conf_thresh: float = CONF_THRESH, max_bytes:
     if count == 0:
         return {"error": "Upload a picture with your face", "status": 422}
 
-    return {"faces": int(count), "is_face": True, "status": 200}
+    try:
+        nudity = detect_image_nudity(img, model_path=os.getenv("NUDENET_MODEL_PATH"))
+    except Exception:
+        return {"error": "Nudity detection failed", "status": 500}
+
+    return {"faces": int(count), "is_face": True, "nudity": nudity, "status": 200}
 
 # ------------------------------------------------------------
 # Queue helpers (face async)
@@ -136,7 +141,7 @@ def get_queue():
         return None
     try:
         conn = redis.from_url(REDIS_URL, ssl_cert_reqs=None)  # Heroku Redis over TLS
-        return Queue("facequeue", connection=conn, default_timeout=30)
+        return Queue("facequeue", connection=conn, default_timeout=900)
     except Exception:
         return None
 
@@ -161,7 +166,7 @@ async def detect_face_sync(file: UploadFile = File(...), x_api_key: str | None =
     result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
     if result.get("error"):
         raise HTTPException(status_code=result["status"], detail=result["error"])
-    return {"faces": result["faces"], "is_face": result["is_face"]}
+    return {"faces": result["faces"], "is_face": result["is_face"], "nudity": result["nudity"]}
 
 @app.post("/detect_async")
 async def detect_face_async(file: UploadFile = File(...), x_api_key: str | None = Header(default=None)):
@@ -174,7 +179,7 @@ async def detect_face_async(file: UploadFile = File(...), x_api_key: str | None 
         result = detect_faces_bytes(data, conf_thresh=CONF_THRESH, max_bytes=MAX_BYTES)
         if result.get("error"):
             raise HTTPException(status_code=result["status"], detail=result["error"])
-        return {"faces": result["faces"], "is_face": result["is_face"], "mode": "sync_fallback"}
+        return {"faces": result["faces"], "is_face": result["is_face"], "nudity": result["nudity"], "mode": "sync_fallback"}
 
     # Enqueue background job
     job = q.enqueue("app.detect_faces_bytes", data, kwargs={"conf_thresh": CONF_THRESH, "max_bytes": MAX_BYTES}, result_ttl=300, ttl=60)
@@ -196,7 +201,7 @@ def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
     result = job.result
     if result.get("error"):
         raise HTTPException(status_code=result["status"], detail=result["error"])
-    return {"status": "done", "faces": result["faces"], "is_face": result["is_face"]}
+    return {"status": "done", "faces": result["faces"], "is_face": result["is_face"], "nudity": result["nudity"]}
 
 # ------------------------------------------------------------
 # Nudity detection route (delegates to nudity_service.py)
@@ -204,7 +209,7 @@ def get_result(job_id: str, x_api_key: str | None = Header(default=None)):
 class NudityRequest(BaseModel):
     video_url: str
 
-from nudity_service import process_video  # one-way import
+from nudity_service import process_video, detect_image_nudity  # one-way import
 
 @app.post("/nudity/detect")
 async def nudity_detect_sync(req: NudityRequest, x_api_key: str | None = Header(default=None)):

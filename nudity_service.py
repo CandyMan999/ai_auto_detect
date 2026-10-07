@@ -148,6 +148,19 @@ def _analyze_preds(frame_idx: int, preds: List[Dict[str, Any]], fps: float) -> L
 
 # --------------------------- Public API ---------------------------
 
+def detect_image_nudity(image, model_path: Optional[str] = None) -> bool:
+    """Check a decoded PIL image using the same labels and threshold as videos.
+
+    Inference errors propagate so an unchecked image is never reported as clean.
+    """
+    detector = _get_detector(model_path)
+    with tempfile.TemporaryDirectory(prefix="nudity-image-") as temp_dir:
+        image_path = os.path.join(temp_dir, "image.png")
+        image.save(image_path, format="PNG")
+        preds = detector.detect(image_path)
+    return bool(_analyze_preds(0, preds, 1.0))
+
+
 def process_video(video_url: str, model_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Download -> sample up to 40 evenly spaced frames -> per-frame detect -> summarize.

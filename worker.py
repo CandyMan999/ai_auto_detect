@@ -3,6 +3,7 @@ import io, os, pathlib, time, requests
 import numpy as np
 from PIL import Image
 import cv2
+from nudity_service import detect_image_nudity
 
 # OPTIONAL HEIC
 try:
@@ -61,4 +62,8 @@ def detect_faces_bytes(
     count = sum(1 for i in range(detections.shape[2]) if float(detections[0,0,i,2]) >= conf_thresh)
     if count == 0:
         return {"error": "Upload a picture with your face", "status": 422}
-    return {"faces": int(count), "is_face": True, "status": 200}
+    try:
+        nudity = detect_image_nudity(img, model_path=os.getenv("NUDENET_MODEL_PATH"))
+    except Exception:
+        return {"error": "Nudity detection failed", "status": 500}
+    return {"faces": int(count), "is_face": True, "nudity": nudity, "status": 200}
