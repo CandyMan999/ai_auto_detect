@@ -141,7 +141,7 @@ def get_queue():
         return None
     try:
         conn = redis.from_url(REDIS_URL, ssl_cert_reqs=None)  # Heroku Redis over TLS
-        return Queue("facequeue", connection=conn, default_timeout=900)
+        return Queue("facequeue", connection=conn, default_timeout=30)
     except Exception:
         return None
 

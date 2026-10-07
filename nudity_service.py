@@ -18,7 +18,7 @@ NUDITY_TAGS = {
     "ANUS_EXPOSED",
 }
 THRESHOLD       = 0.5
-MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 MB
+MAX_VIDEO_BYTES = 200 * 1024 * 1024   # 200 MB
 MAX_FRAMES      = 40                 # <= 40 frames, evenly spaced
 INFER_RES       = 512                # set to 640 if you prefer (slower)
 
@@ -104,7 +104,7 @@ def _download_video(url: str) -> str:
                 f.close()
                 try: os.unlink(f.name)
                 except Exception: pass
-                raise RuntimeError("Video too large (> 50 MB)")
+                raise RuntimeError("Video too large (> 200 MB)")
             f.write(chunk)
         print(f"[nudity] Video saved to {f.name} ({total} bytes)")
         return f.name
